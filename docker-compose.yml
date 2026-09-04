@@ -31,7 +31,7 @@ x-phorge-mysql-init-script: &phorge-mysql-init-script |
 
 services:
   phorge:
-    image: phorge:local
+    image: ghcr.io/zengxs/phorge:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -64,6 +64,14 @@ services:
     networks:
       - frontend
       - database
+    tmpfs:
+      - "/run:mode=0755"
+      - "/run/lock:mode=0755"
+      - "/tmp:mode=1777"
+      - "/var/log/journal:mode=0755"
+    cgroup: private
+    security_opt:
+      - writable-cgroups=true
     healthcheck:
       test: >-
         base_uri="$${PHORGE_BASE_URI:-http://phorge.localhost:$${PHORGE_WEB_PORT:-8080}/}";
