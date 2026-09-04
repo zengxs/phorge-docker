@@ -1,0 +1,140 @@
+x-podman:
+  in_pod: false
+
+x-phorge-mysql-init-script: &phorge-mysql-init-script |
+  #!/bin/bash
+
+  # Percona sources *.sh initializers into its entrypoint instead of executing
+  # them. Do not change shell options here: in particular, enabling nounset
+  # would leak into the parent entrypoint and break its optional variables.
+
+  if [[ ! "$${MYSQL_USER:-}" =~ ^[A-Za-z0-9_]{1,32}$$ ]]; then
+      echo "10-phorge-grants: MYSQL_USER must be 1-32 letters, numbers, or underscores" >&2
+      exit 1
+  fi
+
+  if [[ ! "$${PHORGE_DB_NAMESPACE:-}" =~ ^[A-Za-z0-9_]{1,44}$$ ]]; then
+      echo "10-phorge-grants: PHORGE_DB_NAMESPACE must be 1-44 letters, numbers, or underscores" >&2
+      exit 1
+  fi
+
+  # Phorge owns several databases named "<namespace>_<application>". The
+  # Percona entrypoint has already created MYSQL_USER by the time it sources
+  # this file, so grant that account access only to databases in this namespace.
+  # partial_revokes is disabled below so MySQL interprets this database-level
+  # pattern as a pattern.
+  "$${mysql[@]}" <<EOSQL
+  GRANT ALL PRIVILEGES ON \`$${PHORGE_DB_NAMESPACE}\\_%\`.* TO '$${MYSQL_USER}'@'%';
+  GRANT REPLICATION CLIENT ON *.* TO '$${MYSQL_USER}'@'%';
+  FLUSH PRIVILEGES;
+  EOSQL
+
+services:
+  phorge:
+    image: phorge:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        IMAGE_REVISION: "${IMAGE_REVISION:-development}"
+        PHORGE_REVISION: "${PHORGE_REVISION:-20aaead687fcc9376560adfa57c13a2201faedd4}"
+        ARCANIST_REVISION: "${ARCANIST_REVISION:-63de5a2953b79dbe6aac4ed92bdb64b45cad53d6}"
+    environment:
+      PHORGE_BASE_URI: "${PHORGE_BASE_URI:-}"
+      PHORGE_WEB_PORT: "${PHORGE_WEB_PORT:-8080}"
+      PHORGE_SSH_PORT: "${PHORGE_SSH_PORT:-2222}"
+      PHORGE_VCS_USER: "${PHORGE_VCS_USER:-git}"
+      PHORGE_VCS_UID: "${PHORGE_VCS_UID:-10002}"
+      PHORGE_DB_HOST: mysql
+      PHORGE_DB_PORT: "3306"
+      PHORGE_DB_USER: "${PHORGE_DB_USER:-phorge}"
+      PHORGE_DB_NAMESPACE: "${PHORGE_DB_NAMESPACE:-phabricator}"
+      PHORGE_DB_PASSWORD_FILE: /run/secrets/phorge_db_password
+      PHORGE_AUTO_STORAGE_UPGRADE: "${PHORGE_AUTO_STORAGE_UPGRADE:-1}"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "${PHORGE_WEB_PORT:-8080}:80"
+      - "${PHORGE_SSH_PORT:-2222}:22"
+    volumes:
+      - phorge-data:/var/lib/phorge
+    secrets:
+      - phorge_db_password
+    networks:
+      - frontend
+      - database
+    healthcheck:
+      test: >-
+        base_uri="$${PHORGE_BASE_URI:-http://phorge.localhost:$${PHORGE_WEB_PORT:-8080}/}";
+        host="$${base_uri#*://}";
+        host="$${host%%/*}";
+        curl --fail --silent --show-error --header "Host: $${host}"
+        http://127.0.0.1/status/ >/dev/null
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 2m
+    restart: unless-stopped
+    stop_grace_period: 1m
+
+  mysql:
+    image: docker.io/percona/percona-server:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/mysql_root_password
+      MYSQL_ROOT_HOST: localhost
+      MYSQL_USER: "${PHORGE_DB_USER:-phorge}"
+      MYSQL_PASSWORD_FILE: /run/secrets/phorge_db_password
+      PHORGE_DB_NAMESPACE: "${PHORGE_DB_NAMESPACE:-phabricator}"
+      PHORGE_MYSQL_INIT_SCRIPT: *phorge-mysql-init-script
+      MYSQL_INITDB_SKIP_TZINFO: "1"
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -eu
+        init_script=/docker-entrypoint-initdb.d/10-phorge-grants.sh
+        umask 022
+        printf '%s\n' "$${PHORGE_MYSQL_INIT_SCRIPT}" > "$${init_script}"
+        unset PHORGE_MYSQL_INIT_SCRIPT init_script
+        exec /docker-entrypoint.sh "$$@"
+      - phorge-mysql-entrypoint
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_bin
+      - "--innodb-buffer-pool-size=${MYSQL_INNODB_BUFFER_POOL_SIZE:-1600M}"
+      - --max-allowed-packet=64M
+      - --partial-revokes=OFF
+      - --sql-mode=STRICT_ALL_TABLES
+    volumes:
+      - mysql-data:/var/lib/mysql
+    secrets:
+      - mysql_root_password
+      - phorge_db_password
+    networks:
+      - database
+    healthcheck:
+      test: "mysqladmin ping --host=127.0.0.1 --silent"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 1m
+    restart: unless-stopped
+    stop_grace_period: 1m
+
+networks:
+  frontend:
+  database:
+    internal: true
+
+volumes:
+  phorge-data:
+  mysql-data:
+
+secrets:
+  mysql_root_password:
+    file: "${MYSQL_ROOT_PASSWORD_FILE:-./secrets/mysql_root_password}"
+    x-podman.relabel: Z
+  phorge_db_password:
+    file: "${PHORGE_DB_PASSWORD_FILE:-./secrets/phorge_db_password}"
+    x-podman.relabel: z

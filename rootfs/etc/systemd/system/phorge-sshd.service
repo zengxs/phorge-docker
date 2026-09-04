@@ -1,0 +1,18 @@
+[Unit]
+Description=Phorge locked-down SSH service
+Requires=phorge-prepare.service
+After=network.target phorge-prepare.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/install -d -m 0700 -o root -g root /var/lib/phorge/ssh-host-keys
+ExecStartPre=/bin/sh -c 'test -f /var/lib/phorge/ssh-host-keys/ssh_host_ed25519_key || /usr/bin/ssh-keygen -q -N "" -t ed25519 -f /var/lib/phorge/ssh-host-keys/ssh_host_ed25519_key'
+ExecStartPre=/bin/sh -c 'test -f /var/lib/phorge/ssh-host-keys/ssh_host_rsa_key || /usr/bin/ssh-keygen -q -N "" -t rsa -b 4096 -f /var/lib/phorge/ssh-host-keys/ssh_host_rsa_key'
+ExecStartPre=/usr/sbin/sshd -t -f /run/phorge/sshd_config.phorge
+ExecStart=/usr/sbin/sshd -D -e -f /run/phorge/sshd_config.phorge
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

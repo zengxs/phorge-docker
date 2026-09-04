@@ -1,0 +1,524 @@
+#!/usr/bin/python3
+"""Create the runtime VCS account and render Phorge container configuration."""
+
+from __future__ import annotations
+
+import grp
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from jinja2 import Environment, FileSystemLoader, StrictUndefined, TemplateError
+
+
+PHORGE_ROOT = Path("/app/phorge")
+PHORGE_USER = "phorge"
+PERSISTENT_CONFIG_ROOT = Path("/var/lib/phorge/config")
+PERSISTENT_LOCAL_CONFIG = PERSISTENT_CONFIG_ROOT / "local.json"
+LOCAL_CONFIG = PHORGE_ROOT / "conf/local/local.json"
+RUNTIME_ROOT = Path("/run/phorge")
+TEMPLATE_ROOT = Path("/usr/share/phorge-container/templates")
+SEARCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+VCS_USER_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+DB_USER_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,32}$")
+DB_NAMESPACE_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,44}$")
+DB_HOST_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]+$")
+
+
+class PrepareError(RuntimeError):
+    """A configuration error which should prevent dependent units starting."""
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    vcs_user: str
+    vcs_uid: int
+    web_port: int
+    ssh_port: int
+    base_uri: str
+    public_https: bool
+    db_host: str
+    db_port: int
+    db_user: str
+    db_password: str
+    db_namespace: str
+
+
+def read_port(name: str, default: int) -> int:
+    raw_value = os.environ.get(name, str(default))
+    try:
+        value = int(raw_value, 10)
+    except ValueError as exc:
+        raise PrepareError(f"{name} must be a decimal integer") from exc
+
+    if not 1 <= value <= 65535:
+        raise PrepareError(f"{name} must be between 1 and 65535")
+    return value
+
+
+def read_secret(name: str, default_path: str) -> str:
+    raw_path = os.environ.get(name, default_path)
+    path = Path(raw_path)
+    if not path.is_absolute():
+        raise PrepareError(f"{name} must name an absolute path")
+    if path.is_symlink():
+        raise PrepareError(f"refusing to read symlink as secret: {path}")
+    if not path.is_file():
+        raise PrepareError(f"secret file does not exist: {path}")
+    if path.stat().st_size > 4096:
+        raise PrepareError(f"secret file is unexpectedly large: {path}")
+
+    try:
+        value = path.read_text(encoding="utf-8").rstrip("\r\n")
+    except UnicodeError as exc:
+        raise PrepareError(f"secret file is not valid UTF-8: {path}") from exc
+    if not value:
+        raise PrepareError(f"secret file is empty: {path}")
+    if any(character in value for character in ("\0", "\r", "\n")):
+        raise PrepareError(f"secret file must contain exactly one line: {path}")
+    return value
+
+
+def read_runtime_config() -> RuntimeConfig:
+    vcs_user = os.environ.get("PHORGE_VCS_USER", "git")
+    vcs_uid_raw = os.environ.get("PHORGE_VCS_UID", "10002")
+
+    if not VCS_USER_PATTERN.fullmatch(vcs_user):
+        raise PrepareError(
+            "PHORGE_VCS_USER must be 1-32 characters and match "
+            "[a-z_][a-z0-9_-]*"
+        )
+
+    try:
+        vcs_uid = int(vcs_uid_raw, 10)
+    except ValueError as exc:
+        raise PrepareError("PHORGE_VCS_UID must be a decimal integer") from exc
+
+    if not 1000 <= vcs_uid <= 2_147_483_646:
+        raise PrepareError("PHORGE_VCS_UID must be between 1000 and 2147483646")
+
+    web_port = read_port("PHORGE_WEB_PORT", 8080)
+    ssh_port = read_port("PHORGE_SSH_PORT", 2222)
+    base_uri = os.environ.get("PHORGE_BASE_URI", "").strip()
+    if not base_uri:
+        base_uri = f"http://phorge.localhost:{web_port}/"
+    try:
+        parsed_base_uri = urlsplit(base_uri)
+        base_uri_host = parsed_base_uri.hostname
+    except ValueError as exc:
+        raise PrepareError("PHORGE_BASE_URI must be a valid absolute URI") from exc
+    if parsed_base_uri.scheme.lower() not in {"http", "https"}:
+        raise PrepareError("PHORGE_BASE_URI must use the http or https scheme")
+    if not base_uri_host:
+        raise PrepareError("PHORGE_BASE_URI must be an absolute URI with a host")
+
+    db_host = os.environ.get("PHORGE_DB_HOST", "mysql")
+    if not DB_HOST_PATTERN.fullmatch(db_host):
+        raise PrepareError(
+            "PHORGE_DB_HOST may contain only letters, numbers, dots, colons, "
+            "underscores, and hyphens"
+        )
+
+    db_user = os.environ.get("PHORGE_DB_USER", "phorge")
+    if not DB_USER_PATTERN.fullmatch(db_user):
+        raise PrepareError(
+            "PHORGE_DB_USER must be 1-32 letters, numbers, or underscores"
+        )
+
+    db_namespace = os.environ.get("PHORGE_DB_NAMESPACE", "phabricator")
+    if not DB_NAMESPACE_PATTERN.fullmatch(db_namespace):
+        raise PrepareError(
+            "PHORGE_DB_NAMESPACE must be 1-44 letters, numbers, or underscores"
+        )
+
+    return RuntimeConfig(
+        vcs_user=vcs_user,
+        vcs_uid=vcs_uid,
+        web_port=web_port,
+        ssh_port=ssh_port,
+        base_uri=base_uri,
+        public_https=parsed_base_uri.scheme.lower() == "https",
+        db_host=db_host,
+        db_port=read_port("PHORGE_DB_PORT", 3306),
+        db_user=db_user,
+        db_password=read_secret(
+            "PHORGE_DB_PASSWORD_FILE",
+            "/run/secrets/phorge_db_password",
+        ),
+        db_namespace=db_namespace,
+    )
+
+
+def run_checked(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(argv, check=True, text=True, **kwargs)
+    except (OSError, subprocess.SubprocessError) as exc:
+        command = " ".join(argv)
+        raise PrepareError(f"command failed: {command}") from exc
+
+
+def ensure_root_directory(path: Path, mode: int) -> None:
+    if path.is_symlink():
+        raise PrepareError(f"refusing to use symlink as directory: {path}")
+    path.mkdir(parents=True, exist_ok=True)
+    if not path.is_dir():
+        raise PrepareError(f"expected a directory: {path}")
+    os.chown(path, 0, 0)
+    os.chmod(path, mode)
+
+
+def validate_local_config_link() -> None:
+    if not LOCAL_CONFIG.is_symlink():
+        raise PrepareError(f"expected a symbolic link: {LOCAL_CONFIG}")
+
+    link_target = os.readlink(LOCAL_CONFIG)
+    if link_target != str(PERSISTENT_LOCAL_CONFIG):
+        raise PrepareError(
+            f"unexpected local config link target: {LOCAL_CONFIG} -> {link_target}"
+        )
+
+
+def ensure_persistent_local_config(uid: int, gid: int) -> None:
+    if PERSISTENT_CONFIG_ROOT.is_symlink():
+        raise PrepareError(
+            f"refusing to use symlink as directory: {PERSISTENT_CONFIG_ROOT}"
+        )
+    PERSISTENT_CONFIG_ROOT.mkdir(parents=False, exist_ok=True)
+    if not PERSISTENT_CONFIG_ROOT.is_dir():
+        raise PrepareError(f"expected a directory: {PERSISTENT_CONFIG_ROOT}")
+    os.chown(PERSISTENT_CONFIG_ROOT, 0, gid)
+    os.chmod(PERSISTENT_CONFIG_ROOT, 0o750)
+
+    if PERSISTENT_LOCAL_CONFIG.is_symlink():
+        raise PrepareError(
+            f"refusing to use symlink as persistent config: "
+            f"{PERSISTENT_LOCAL_CONFIG}"
+        )
+    if PERSISTENT_LOCAL_CONFIG.exists():
+        if not PERSISTENT_LOCAL_CONFIG.is_file():
+            raise PrepareError(
+                f"expected a regular file: {PERSISTENT_LOCAL_CONFIG}"
+            )
+    else:
+        temporary_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix=".local.json.",
+                dir=PERSISTENT_CONFIG_ROOT,
+                delete=False,
+            ) as temporary:
+                temporary_name = temporary.name
+                temporary.write("{}\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                os.fchown(temporary.fileno(), uid, gid)
+                os.fchmod(temporary.fileno(), 0o640)
+
+            os.replace(temporary_name, PERSISTENT_LOCAL_CONFIG)
+            temporary_name = None
+        finally:
+            if temporary_name is not None:
+                Path(temporary_name).unlink(missing_ok=True)
+
+    try:
+        local_values = json.loads(
+            PERSISTENT_LOCAL_CONFIG.read_text(encoding="utf-8")
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise PrepareError(
+            f"persistent local config is not valid JSON: "
+            f"{PERSISTENT_LOCAL_CONFIG}"
+        ) from exc
+    if not isinstance(local_values, dict):
+        raise PrepareError(
+            f"persistent local config must contain a JSON object: "
+            f"{PERSISTENT_LOCAL_CONFIG}"
+        )
+
+    os.chown(PERSISTENT_LOCAL_CONFIG, uid, gid)
+    os.chmod(PERSISTENT_LOCAL_CONFIG, 0o640)
+
+    local_directory = LOCAL_CONFIG.parent
+    if local_directory.is_symlink() or not local_directory.is_dir():
+        raise PrepareError(f"expected a real directory: {local_directory}")
+    os.chown(local_directory, 0, 0)
+    os.chmod(local_directory, 0o755)
+
+    if LOCAL_CONFIG.is_symlink():
+        validate_local_config_link()
+    elif os.path.lexists(LOCAL_CONFIG):
+        raise PrepareError(
+            f"refusing to replace non-symlink local config: {LOCAL_CONFIG}"
+        )
+    else:
+        LOCAL_CONFIG.symlink_to(PERSISTENT_LOCAL_CONFIG)
+        validate_local_config_link()
+
+
+def ensure_vcs_account(vcs_user: str, vcs_uid: int) -> None:
+    try:
+        phorge_group = grp.getgrnam(PHORGE_USER)
+    except KeyError as exc:
+        raise PrepareError("required group 'phorge' does not exist") from exc
+
+    try:
+        account = pwd.getpwnam(vcs_user)
+    except KeyError:
+        try:
+            collision = pwd.getpwuid(vcs_uid)
+        except KeyError:
+            collision = None
+
+        if collision is not None:
+            raise PrepareError(
+                f"PHORGE_VCS_UID {vcs_uid} is already used by {collision.pw_name!r}"
+            )
+
+        run_checked(
+            [
+                "/usr/sbin/useradd",
+                "--uid",
+                str(vcs_uid),
+                "--gid",
+                str(phorge_group.gr_gid),
+                "--home-dir",
+                "/var/empty",
+                "--no-create-home",
+                "--shell",
+                "/bin/sh",
+                "--password",
+                "NP",
+                vcs_user,
+            ]
+        )
+        account = pwd.getpwnam(vcs_user)
+
+    expected = {
+        "uid": (account.pw_uid, vcs_uid),
+        "primary gid": (account.pw_gid, phorge_group.gr_gid),
+        "home": (account.pw_dir, "/var/empty"),
+        "shell": (account.pw_shell, "/bin/sh"),
+    }
+    mismatches = [
+        f"{name} is {actual!r}, expected {wanted!r}"
+        for name, (actual, wanted) in expected.items()
+        if actual != wanted
+    ]
+    if mismatches:
+        raise PrepareError(
+            f"existing account {vcs_user!r} is incompatible: " + "; ".join(mismatches)
+        )
+
+    # OpenSSH rejects locked accounts before consulting AuthorizedKeysCommand.
+    # "NP" is an unusable, but non-locked, password value. Password login is
+    # separately disabled in the dedicated sshd configuration.
+    run_checked(["/usr/sbin/usermod", "--password", "NP", vcs_user])
+    ensure_root_directory(Path("/var/empty"), 0o755)
+
+
+def find_binary(name: str, git_exec_path: Path | None = None) -> str:
+    candidate = shutil.which(name, path=SEARCH_PATH)
+    if candidate is None and git_exec_path is not None:
+        fallback = git_exec_path / name
+        if fallback.is_file() and os.access(fallback, os.X_OK):
+            candidate = str(fallback)
+
+    if candidate is None:
+        raise PrepareError(f"required executable was not found: {name}")
+    if not candidate.startswith("/") or re.search(r"[\s,:=\\]", candidate):
+        raise PrepareError(f"executable path is unsafe for sudoers: {candidate!r}")
+    return candidate
+
+
+def render_file(
+    environment: Environment,
+    template_name: str,
+    destination: Path,
+    mode: int,
+    context: dict[str, object],
+) -> None:
+    rendered = environment.get_template(template_name).render(**context)
+    if not rendered.endswith("\n"):
+        rendered += "\n"
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=f".{destination.name}.",
+            dir=destination.parent,
+            delete=False,
+        ) as temporary:
+            temporary_name = temporary.name
+            temporary.write(rendered)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+
+        os.chown(temporary_name, 0, 0)
+        os.chmod(temporary_name, mode)
+        os.replace(temporary_name, destination)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            Path(temporary_name).unlink(missing_ok=True)
+
+
+def render_configuration(config: RuntimeConfig) -> None:
+    ensure_root_directory(RUNTIME_ROOT, 0o755)
+
+    git_binary = find_binary("git")
+    result = run_checked(
+        [git_binary, "--exec-path"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    git_exec_path = Path(result.stdout.strip())
+    if not git_exec_path.is_absolute():
+        raise PrepareError("git --exec-path did not return an absolute path")
+
+    context: dict[str, object] = {
+        "vcs_user": config.vcs_user,
+        "phorge_root": str(PHORGE_ROOT),
+        "ssh_hook_path": str(RUNTIME_ROOT / "phorge-ssh-hook.sh"),
+        "git_binary": git_binary,
+        "git_upload_pack_binary": find_binary("git-upload-pack", git_exec_path),
+        "git_receive_pack_binary": find_binary("git-receive-pack", git_exec_path),
+        "public_https": config.public_https,
+    }
+    environment = Environment(
+        loader=FileSystemLoader(TEMPLATE_ROOT),
+        undefined=StrictUndefined,
+        autoescape=False,
+        keep_trailing_newline=True,
+    )
+
+    hook_path = RUNTIME_ROOT / "phorge-ssh-hook.sh"
+    sshd_config_path = RUNTIME_ROOT / "sshd_config.phorge"
+    sudoers_path = Path("/etc/sudoers.d/phorge")
+    preamble_path = PHORGE_ROOT / "support/preamble.php"
+
+    render_file(
+        environment,
+        "run/phorge/phorge-ssh-hook.sh.j2",
+        hook_path,
+        0o755,
+        context,
+    )
+    render_file(
+        environment,
+        "run/phorge/sshd_config.phorge.j2",
+        sshd_config_path,
+        0o600,
+        context,
+    )
+    render_file(
+        environment,
+        "etc/sudoers.d/phorge.j2",
+        sudoers_path,
+        0o440,
+        context,
+    )
+    render_file(
+        environment,
+        "app/phorge/support/preamble.php.j2",
+        preamble_path,
+        0o644,
+        context,
+    )
+
+    run_checked(["/bin/sh", "-n", str(hook_path)])
+    run_checked(["/usr/sbin/visudo", "-cf", str(sudoers_path)])
+    run_checked([find_binary("php"), "-l", str(preamble_path)])
+
+
+def configure_phorge(config: RuntimeConfig) -> None:
+    try:
+        account = pwd.getpwnam(PHORGE_USER)
+    except KeyError as exc:
+        raise PrepareError("required user 'phorge' does not exist") from exc
+
+    ensure_persistent_local_config(account.pw_uid, account.pw_gid)
+
+    def drop_privileges() -> None:
+        os.initgroups(PHORGE_USER, account.pw_gid)
+        os.setgid(account.pw_gid)
+        os.setuid(account.pw_uid)
+
+    child_environment = {
+        "HOME": account.pw_dir,
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LOGNAME": PHORGE_USER,
+        "PATH": SEARCH_PATH,
+        "USER": PHORGE_USER,
+    }
+    settings = [
+        ("storage.default-namespace", config.db_namespace, False),
+        ("mysql.host", config.db_host, False),
+        ("mysql.port", str(config.db_port), False),
+        ("mysql.user", config.db_user, False),
+        ("mysql.pass", config.db_password, True),
+        ("phabricator.base-uri", config.base_uri, False),
+        ("diffusion.ssh-user", config.vcs_user, False),
+        ("diffusion.ssh-port", str(config.ssh_port), False),
+        ("repository.default-local-path", "/var/lib/phorge/repositories", False),
+        ("storage.local-disk.path", "/var/lib/phorge/files", False),
+        ("phd.log-directory", "/var/lib/phorge/daemon", False),
+        ("pygments.enabled", "true", False),
+        ("files.enable-imagemagick", "true", False),
+    ]
+    for key, value, use_stdin in settings:
+        argv = [str(PHORGE_ROOT / "bin/config"), "set", key]
+        kwargs: dict[str, object] = {
+            "cwd": PHORGE_ROOT,
+            "env": child_environment,
+            "preexec_fn": drop_privileges,
+        }
+        if use_stdin:
+            argv.append("--stdin")
+            kwargs["input"] = value
+        else:
+            argv.append(value)
+        run_checked(argv, **kwargs)
+
+    validate_local_config_link()
+    if not PERSISTENT_LOCAL_CONFIG.is_file():
+        raise PrepareError(
+            f"Phorge did not preserve local config: {PERSISTENT_LOCAL_CONFIG}"
+        )
+    os.chown(PERSISTENT_LOCAL_CONFIG, account.pw_uid, account.pw_gid)
+    os.chmod(PERSISTENT_LOCAL_CONFIG, 0o640)
+
+
+def main() -> int:
+    os.umask(0o077)
+    try:
+        config = read_runtime_config()
+        ensure_vcs_account(config.vcs_user, config.vcs_uid)
+        render_configuration(config)
+        configure_phorge(config)
+    except (PrepareError, OSError, TemplateError) as exc:
+        print(f"phorge-prepare: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        "phorge-prepare: configured "
+        f"VCS user {config.vcs_user!r} (UID {config.vcs_uid}) and database "
+        f"{config.db_user!r}@{config.db_host}:{config.db_port}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

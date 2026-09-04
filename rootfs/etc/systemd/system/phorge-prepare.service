@@ -1,0 +1,12 @@
+[Unit]
+Description=Prepare Phorge runtime configuration
+After=local-fs.target systemd-tmpfiles-setup.service
+
+[Service]
+Type=oneshot
+PassEnvironment=PHORGE_BASE_URI PHORGE_WEB_PORT PHORGE_SSH_PORT
+PassEnvironment=PHORGE_VCS_USER PHORGE_VCS_UID
+PassEnvironment=PHORGE_DB_HOST PHORGE_DB_PORT PHORGE_DB_USER
+PassEnvironment=PHORGE_DB_PASSWORD_FILE PHORGE_DB_NAMESPACE
+ExecStart=/usr/libexec/phorge-prepare
+RemainAfterExit=yes

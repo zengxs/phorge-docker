@@ -1,0 +1,12 @@
+.env
+.tmp/
+secrets/
+
+# Runtime configuration may contain database and mail-provider credentials.
+phorge/conf/local/local.json
+phorge/conf/local/ENVIRONMENT
+phorge/support/preamble.php
+
+# Component Git metadata is reconstructed from pinned revisions during build.
+.git
+**/.git
