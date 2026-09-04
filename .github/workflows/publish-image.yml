@@ -1,0 +1,215 @@
+name: Publish container image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: publish-phorge-container
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            machine: x86_64
+            artifact: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            machine: aarch64
+            artifact: arm64
+
+    steps:
+      - name: Check out repository and submodules
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Resolve image and source revisions
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          phorge_revision="$(git -C phorge rev-parse --verify HEAD)"
+          arcanist_revision="$(git -C arcanist rev-parse --verify HEAD)"
+
+          if [[ ! "${phorge_revision}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid Phorge revision: ${phorge_revision}" >&2
+            exit 1
+          fi
+          if [[ ! "${arcanist_revision}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid Arcanist revision: ${arcanist_revision}" >&2
+            exit 1
+          fi
+
+          echo "image=ghcr.io/${owner}/phorge" >> "${GITHUB_OUTPUT}"
+          echo "phorge_revision=${phorge_revision}" >> "${GITHUB_OUTPUT}"
+          echo "arcanist_revision=${arcanist_revision}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify native runner architecture
+        shell: bash
+        env:
+          EXPECTED_MACHINE: ${{ matrix.machine }}
+        run: |
+          set -euo pipefail
+
+          actual_machine="$(uname -m)"
+          if [[ "${actual_machine}" != "${EXPECTED_MACHINE}" ]]; then
+            echo "Expected ${EXPECTED_MACHINE}, got ${actual_machine}" >&2
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            IMAGE_REVISION=${{ github.sha }}
+            PHORGE_REVISION=${{ steps.metadata.outputs.phorge_revision }}
+            ARCANIST_REVISION=${{ steps.metadata.outputs.arcanist_revision }}
+          cache-from: type=gha,scope=phorge-${{ matrix.artifact }}
+          cache-to: type=gha,mode=max,scope=phorge-${{ matrix.artifact }}
+          outputs: type=image,name=${{ steps.metadata.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export image digest
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          digest="${IMAGE_DIGEST#sha256:}"
+          if [[ ! "${digest}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Invalid image digest: ${IMAGE_DIGEST}" >&2
+            exit 1
+          fi
+
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${digest}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish multi-platform manifest
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Resolve image name
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "image=ghcr.io/${owner}/phorge" >> "${GITHUB_OUTPUT}"
+
+      - name: Download image digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digests-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Create and verify manifest
+        shell: bash
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t digests < <(
+            find "${RUNNER_TEMP}/digests" -maxdepth 1 -type f -printf '%f\n' |
+              LC_ALL=C sort
+          )
+          if [[ "${#digests[@]}" -ne 2 ]]; then
+            echo "Expected 2 platform digests, got ${#digests[@]}" >&2
+            exit 1
+          fi
+
+          sources=()
+          for digest in "${digests[@]}"; do
+            if [[ ! "${digest}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Invalid digest artifact: ${digest}" >&2
+              exit 1
+            fi
+            sources+=("${IMAGE}@sha256:${digest}")
+          done
+
+          date_tag="$(date --utc +%Y%m%d)"
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" \
+            --tag "${IMAGE}:${date_tag}" \
+            "${sources[@]}"
+
+          manifest_file="${RUNNER_TEMP}/manifest.json"
+          docker buildx imagetools inspect "${IMAGE}:${date_tag}" \
+            --format '{{json .Manifest}}' > "${manifest_file}"
+
+          jq --exit-status '
+            [
+              .manifests[]
+              | select(.platform.os == "linux")
+              | "\(.platform.os)/\(.platform.architecture)"
+            ]
+            | sort == ["linux/amd64", "linux/arm64"]
+          ' "${manifest_file}" >/dev/null
+
+          date_digest="$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))' "${manifest_file}")"
+          latest_digest="$(
+            docker buildx imagetools inspect "${IMAGE}:latest" \
+              --format '{{json .Manifest}}' |
+              jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))'
+          )"
+          if [[ "${latest_digest}" != "${date_digest}" ]]; then
+            echo "latest and ${date_tag} resolved to different manifests" >&2
+            exit 1
+          fi
+
+          printf '### Published container image\n\n- `%s:latest`\n- `%s:%s`\n- manifest `%s`\n' \
+            "${IMAGE}" "${IMAGE}" "${date_tag}" "${date_digest}" \
+            >> "${GITHUB_STEP_SUMMARY}"
