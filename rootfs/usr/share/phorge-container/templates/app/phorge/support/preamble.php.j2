@@ -4,3 +4,5 @@
 // Expose the canonical public scheme to Phorge without trusting a
 // client-supplied forwarding header.
 $_SERVER['HTTPS'] = {{ 'true' if public_https else 'false' }};
+
+preamble_trust_x_forwarded_for_header();
