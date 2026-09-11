@@ -14,4 +14,4 @@ case "${PHORGE_AUTO_STORAGE_UPGRADE:-1}" in
         ;;
 esac
 
-exec /app/phorge/bin/storage upgrade --force
+exec /opt/phorge/bin/storage upgrade --force

@@ -1,0 +1,9 @@
+type = process
+command = /usr/sbin/sshd -D -f /run/phorge/sshd_config.phorge
+depends-on: phorge-prepare
+depends-on: phorge-log@phorge-sshd
+restart = on-failure
+restart-delay = 5
+smooth-recovery = true
+stop-timeout = 10
+log-type = pipe

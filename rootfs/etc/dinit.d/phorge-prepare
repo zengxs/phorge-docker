@@ -1,0 +1,5 @@
+type = scripted
+command = /usr/libexec/phorge-log-output phorge-prepare /usr/libexec/phorge-prepare
+depends-on: phorge-runtime-init
+restart = false
+options = shares-console start-interruptible

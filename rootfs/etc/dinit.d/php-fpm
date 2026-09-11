@@ -1,0 +1,10 @@
+type = process
+command = /usr/sbin/php-fpm --nodaemonize
+depends-on: phorge-storage-upgrade
+depends-on: phorge-log@php-fpm
+restart = on-failure
+restart-delay = 5
+smooth-recovery = true
+term-signal = QUIT
+stop-timeout = 45
+log-type = pipe

@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+# Dinit passes each service's stdout/stderr pipe to this supervised consumer.
+case "$1" in
+    nginx) log_tag=nginx-service ;;
+    php-fpm) log_tag=php-fpm-error ;;
+    phorge-sshd) log_tag=sshd-service ;;
+    phorge-phd) log_tag=phd-service ;;
+    phorge-logrotate) log_tag=logrotate-service ;;
+    *) echo "phorge-log-relay: unknown service: $1" >&2; exit 1 ;;
+esac
+
+exec logger --socket /dev/log --socket-errors=on \
+    --tag "$log_tag" --priority daemon.info --size 65536

@@ -1,0 +1,53 @@
+#!/bin/sh
+set -eu
+
+# Recreate runtime directories and apply the former tmpfiles ownership/modes.
+install -d -o phorge -g phorge -m 0750 \
+    /var/lib/phorge \
+    /var/lib/phorge/repositories \
+    /var/lib/phorge/files \
+    /var/lib/phorge/working-copies
+install -d -o root -g phorge -m 0750 /var/lib/phorge/config
+install -d -o phorge -g phorge -m 0700 \
+    /var/lib/phorge/tmp \
+    /var/lib/phorge/sessions \
+    /var/lib/phorge/opcache \
+    /run/phorge-phd
+install -d -o root -g root -m 0700 /var/lib/phorge/logrotate
+install -d -o root -g root -m 0755 /run/php-fpm
+install -d -o root -g root -m 0755 /var/log/phorge/logs
+
+# Migrate application data from older image UIDs without following symlinks.
+# Configuration, SSH host keys and logging state have separate ownership.
+chown -hR phorge:phorge \
+    /var/lib/phorge/repositories \
+    /var/lib/phorge/files \
+    /var/lib/phorge/working-copies \
+    /var/lib/phorge/tmp \
+    /var/lib/phorge/sessions \
+    /var/lib/phorge/opcache
+
+# phd fixes the filename to daemons.log. Its alias points to a runtime FIFO;
+# only rsyslog writes the final file in the persistent log volume.
+phd_fifo=/run/phorge-phd/phd-daemons.fifo
+if [ -L "$phd_fifo" ] || { [ -e "$phd_fifo" ] && [ ! -p "$phd_fifo" ]; }; then
+    echo "phorge-runtime-init: expected a FIFO: $phd_fifo" >&2
+    exit 1
+fi
+if [ ! -p "$phd_fifo" ]; then
+    mkfifo -m 0600 "$phd_fifo"
+fi
+chown phorge:phorge "$phd_fifo"
+chmod 0600 "$phd_fifo"
+ln -sfn phd-daemons.fifo /run/phorge-phd/daemons.log
+
+# Host keys live in the data volume so container recreation preserves identity.
+install -d -o root -g root -m 0700 /var/lib/phorge/ssh-host-keys
+if [ ! -f /var/lib/phorge/ssh-host-keys/ssh_host_ed25519_key ]; then
+    ssh-keygen -q -N "" -t ed25519 \
+        -f /var/lib/phorge/ssh-host-keys/ssh_host_ed25519_key
+fi
+if [ ! -f /var/lib/phorge/ssh-host-keys/ssh_host_rsa_key ]; then
+    ssh-keygen -q -N "" -t rsa -b 4096 \
+        -f /var/lib/phorge/ssh-host-keys/ssh_host_rsa_key
+fi

@@ -1,0 +1,17 @@
+/var/log/phorge/logs/*.log {
+    daily
+    maxsize 100M
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+    su root root
+    sharedscripts
+    postrotate
+        if [ -s /run/rsyslog/rsyslog.pid ]; then
+            /bin/kill -HUP "$(cat /run/rsyslog/rsyslog.pid)"
+        fi
+    endscript
+}

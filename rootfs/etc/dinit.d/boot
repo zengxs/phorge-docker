@@ -1,0 +1,7 @@
+type = internal
+restart = false
+depends-on: nginx
+depends-on: php-fpm
+depends-on: phorge-phd
+depends-on: phorge-sshd
+depends-on: phorge-logrotate

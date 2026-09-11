@@ -1,0 +1,10 @@
+type = process
+command = /usr/sbin/nginx -g "daemon off;"
+depends-on: phorge-storage-upgrade
+depends-on: phorge-log@nginx
+restart = on-failure
+restart-delay = 5
+smooth-recovery = true
+term-signal = QUIT
+stop-timeout = 45
+log-type = pipe

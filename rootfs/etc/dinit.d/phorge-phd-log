@@ -1,0 +1,11 @@
+type = process
+command = /usr/libexec/phorge-log-fifo phd-daemons /run/phorge-phd/phd-daemons.fifo
+run-as = phorge
+load-options = export-passwd-vars
+depends-on: phorge-runtime-init
+restart = true
+restart-delay = 1
+restart-limit-count = 0
+smooth-recovery = true
+stop-timeout = 10
+options = shares-console

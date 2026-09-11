@@ -1,0 +1,27 @@
+#!/usr/bin/php
+<?php
+
+require_once '/opt/phorge/scripts/__init_script__.php';
+
+// Keep Phorge's standard daemon selection, task leases and logging behavior.
+$err = phutil_passthru('/opt/phorge/bin/phd start');
+if ($err) {
+  exit($err);
+}
+
+// phd daemonizes without a PID file. Expose its overseer to Dinit so the
+// actual daemon is supervised after this launcher exits.
+$query = id(new PhutilProcessQuery())->withIsOverseer(true);
+$instance = PhabricatorEnv::getEnvConfig('cluster.instance');
+if ($instance !== null) {
+  $query->withInstances(array($instance));
+}
+$overseers = $query->execute();
+if (count($overseers) !== 1) {
+  phutil_passthru('/opt/phorge/bin/phd stop');
+  throw new Exception('Expected exactly one Phorge daemon overseer.');
+}
+
+Filesystem::writeFile(
+  '/run/phorge-phd/overseer.pid',
+  head($overseers)->getPID()."\n");

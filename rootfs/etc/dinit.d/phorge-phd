@@ -1,0 +1,16 @@
+type = bgprocess
+command = /usr/libexec/phorge-phd-start
+stop-command = /opt/phorge/bin/phd stop
+pid-file = /run/phorge-phd/overseer.pid
+working-dir = /opt/phorge
+run-as = phorge
+load-options = export-passwd-vars
+depends-on: phorge-storage-upgrade
+depends-on: phorge-phd-log
+depends-on: phorge-log@phorge-phd
+restart = on-failure
+restart-delay = 5
+smooth-recovery = true
+stop-timeout = 45
+options = start-interruptible
+log-type = pipe

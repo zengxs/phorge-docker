@@ -1,0 +1,9 @@
+type = process
+command = /usr/libexec/phorge-log-fifo dinit-service /run/rsyslog/dinit-service.fifo
+depends-on: rsyslog
+restart = true
+restart-delay = 1
+restart-limit-count = 0
+smooth-recovery = true
+stop-timeout = 10
+options = shares-console

@@ -1,9 +1,8 @@
 #!/usr/bin/python3
-"""Create the runtime VCS account and render Phorge container configuration."""
+"""Render Phorge container configuration using the image's fixed accounts."""
 
 from __future__ import annotations
 
-import grp
 import json
 import os
 import pwd
@@ -19,15 +18,15 @@ from urllib.parse import urlsplit
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, TemplateError
 
 
-PHORGE_ROOT = Path("/app/phorge")
+PHORGE_ROOT = Path("/opt/phorge")
 PHORGE_USER = "phorge"
+VCS_USER = "git"
 PERSISTENT_CONFIG_ROOT = Path("/var/lib/phorge/config")
 PERSISTENT_LOCAL_CONFIG = PERSISTENT_CONFIG_ROOT / "local.json"
 LOCAL_CONFIG = PHORGE_ROOT / "conf/local/local.json"
 RUNTIME_ROOT = Path("/run/phorge")
 TEMPLATE_ROOT = Path("/usr/share/phorge-container/templates")
 SEARCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-VCS_USER_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 DB_USER_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,32}$")
 DB_NAMESPACE_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,44}$")
 DB_HOST_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]+$")
@@ -39,8 +38,6 @@ class PrepareError(RuntimeError):
 
 @dataclass(frozen=True)
 class RuntimeConfig:
-    vcs_user: str
-    vcs_uid: int
     web_port: int
     ssh_port: int
     base_uri: str
@@ -88,23 +85,6 @@ def read_secret(name: str, default_path: str) -> str:
 
 
 def read_runtime_config() -> RuntimeConfig:
-    vcs_user = os.environ.get("PHORGE_VCS_USER", "git")
-    vcs_uid_raw = os.environ.get("PHORGE_VCS_UID", "10002")
-
-    if not VCS_USER_PATTERN.fullmatch(vcs_user):
-        raise PrepareError(
-            "PHORGE_VCS_USER must be 1-32 characters and match "
-            "[a-z_][a-z0-9_-]*"
-        )
-
-    try:
-        vcs_uid = int(vcs_uid_raw, 10)
-    except ValueError as exc:
-        raise PrepareError("PHORGE_VCS_UID must be a decimal integer") from exc
-
-    if not 1000 <= vcs_uid <= 2_147_483_646:
-        raise PrepareError("PHORGE_VCS_UID must be between 1000 and 2147483646")
-
     web_port = read_port("PHORGE_WEB_PORT", 8080)
     ssh_port = read_port("PHORGE_SSH_PORT", 2222)
     base_uri = os.environ.get("PHORGE_BASE_URI", "").strip()
@@ -140,8 +120,6 @@ def read_runtime_config() -> RuntimeConfig:
         )
 
     return RuntimeConfig(
-        vcs_user=vcs_user,
-        vcs_uid=vcs_uid,
         web_port=web_port,
         ssh_port=ssh_port,
         base_uri=base_uri,
@@ -265,67 +243,6 @@ def ensure_persistent_local_config(uid: int, gid: int) -> None:
         validate_local_config_link()
 
 
-def ensure_vcs_account(vcs_user: str, vcs_uid: int) -> None:
-    try:
-        phorge_group = grp.getgrnam(PHORGE_USER)
-    except KeyError as exc:
-        raise PrepareError("required group 'phorge' does not exist") from exc
-
-    try:
-        account = pwd.getpwnam(vcs_user)
-    except KeyError:
-        try:
-            collision = pwd.getpwuid(vcs_uid)
-        except KeyError:
-            collision = None
-
-        if collision is not None:
-            raise PrepareError(
-                f"PHORGE_VCS_UID {vcs_uid} is already used by {collision.pw_name!r}"
-            )
-
-        run_checked(
-            [
-                "/usr/sbin/useradd",
-                "--uid",
-                str(vcs_uid),
-                "--gid",
-                str(phorge_group.gr_gid),
-                "--home-dir",
-                "/var/empty",
-                "--no-create-home",
-                "--shell",
-                "/bin/sh",
-                "--password",
-                "NP",
-                vcs_user,
-            ]
-        )
-        account = pwd.getpwnam(vcs_user)
-
-    expected = {
-        "uid": (account.pw_uid, vcs_uid),
-        "primary gid": (account.pw_gid, phorge_group.gr_gid),
-        "home": (account.pw_dir, "/var/empty"),
-        "shell": (account.pw_shell, "/bin/sh"),
-    }
-    mismatches = [
-        f"{name} is {actual!r}, expected {wanted!r}"
-        for name, (actual, wanted) in expected.items()
-        if actual != wanted
-    ]
-    if mismatches:
-        raise PrepareError(
-            f"existing account {vcs_user!r} is incompatible: " + "; ".join(mismatches)
-        )
-
-    # OpenSSH rejects locked accounts before consulting AuthorizedKeysCommand.
-    # "NP" is an unusable, but non-locked, password value. Password login is
-    # separately disabled in the dedicated sshd configuration.
-    run_checked(["/usr/sbin/usermod", "--password", "NP", vcs_user])
-    ensure_root_directory(Path("/var/empty"), 0o755)
-
-
 def find_binary(name: str, git_exec_path: Path | None = None) -> str:
     candidate = shutil.which(name, path=SEARCH_PATH)
     if candidate is None and git_exec_path is not None:
@@ -389,7 +306,7 @@ def render_configuration(config: RuntimeConfig) -> None:
         raise PrepareError("git --exec-path did not return an absolute path")
 
     context: dict[str, object] = {
-        "vcs_user": config.vcs_user,
+        "vcs_user": VCS_USER,
         "phorge_root": str(PHORGE_ROOT),
         "ssh_hook_path": str(RUNTIME_ROOT / "phorge-ssh-hook.sh"),
         "git_binary": git_binary,
@@ -432,7 +349,7 @@ def render_configuration(config: RuntimeConfig) -> None:
     )
     render_file(
         environment,
-        "app/phorge/support/preamble.php.j2",
+        "opt/phorge/support/preamble.php.j2",
         preamble_path,
         0o644,
         context,
@@ -470,11 +387,11 @@ def configure_phorge(config: RuntimeConfig) -> None:
         ("mysql.user", config.db_user, False),
         ("mysql.pass", config.db_password, True),
         ("phabricator.base-uri", config.base_uri, False),
-        ("diffusion.ssh-user", config.vcs_user, False),
+        ("diffusion.ssh-user", VCS_USER, False),
         ("diffusion.ssh-port", str(config.ssh_port), False),
         ("repository.default-local-path", "/var/lib/phorge/repositories", False),
         ("storage.local-disk.path", "/var/lib/phorge/files", False),
-        ("phd.log-directory", "/var/lib/phorge/daemon", False),
+        ("phd.log-directory", "/run/phorge-phd", False),
         ("pygments.enabled", "true", False),
         ("files.enable-imagemagick", "true", False),
     ]
@@ -505,7 +422,6 @@ def main() -> int:
     os.umask(0o077)
     try:
         config = read_runtime_config()
-        ensure_vcs_account(config.vcs_user, config.vcs_uid)
         render_configuration(config)
         configure_phorge(config)
     except (PrepareError, OSError, TemplateError) as exc:
@@ -514,7 +430,7 @@ def main() -> int:
 
     print(
         "phorge-prepare: configured "
-        f"VCS user {config.vcs_user!r} (UID {config.vcs_uid}) and database "
+        f"VCS user {VCS_USER!r} and database "
         f"{config.db_user!r}@{config.db_host}:{config.db_port}"
     )
     return 0

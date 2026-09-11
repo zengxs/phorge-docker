@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+umask 0027
+
+# Bootstrap only the directories needed before rsyslog can receive init logs.
+install -d -o root -g root -m 0755 /var/log/phorge/logs
+install -d -o root -g root -m 0755 /run/rsyslog
+install -d -o phorge -g phorge -m 0750 /var/lib/phorge
+install -d -o root -g root -m 0700 /var/lib/phorge/rsyslog
+
+# Keep a reader open before Dinit opens its nonblocking log destination, and
+# across forwarding restarts. Dinit writes the FIFO; rsyslog owns the final file.
+dinit_fifo=/run/rsyslog/dinit-service.fifo
+if [ -L "$dinit_fifo" ] || { [ -e "$dinit_fifo" ] && [ ! -p "$dinit_fifo" ]; }; then
+    echo "phorge-entrypoint: expected a FIFO: $dinit_fifo" >&2
+    exit 1
+fi
+if [ ! -p "$dinit_fifo" ]; then
+    mkfifo -m 0600 "$dinit_fifo"
+fi
+chown root:root "$dinit_fifo"
+chmod 0600 "$dinit_fifo"
+exec 3<>"$dinit_fifo"
+
+# Migrate existing application-owned logs to the single file writer. Preserve
+# their contents, and refuse symlinks before rsyslog opens any destination.
+for log_file in /var/log/phorge/logs/*.log; do
+    if [ -L "$log_file" ] || { [ -e "$log_file" ] && [ ! -f "$log_file" ]; }; then
+        echo "phorge-entrypoint: expected a regular log file: $log_file" >&2
+        exit 1
+    fi
+    if [ -f "$log_file" ]; then
+        chown root:root "$log_file"
+        chmod 0640 "$log_file"
+    fi
+done
+
+exec "$@"

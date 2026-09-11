@@ -1,0 +1,9 @@
+type = bgprocess
+command = /usr/sbin/rsyslogd -f /etc/rsyslog.conf -i /run/rsyslog/rsyslog.pid
+pid-file = /run/rsyslog/rsyslog.pid
+restart = true
+restart-delay = 1
+restart-limit-count = 0
+smooth-recovery = true
+stop-timeout = 45
+options = shares-console

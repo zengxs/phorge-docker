@@ -92,9 +92,8 @@ jobs:
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           build-args: |
-            IMAGE_REVISION=${{ github.sha }}
-            PHORGE_REVISION=${{ steps.metadata.outputs.phorge_revision }}
-            ARCANIST_REVISION=${{ steps.metadata.outputs.arcanist_revision }}
+            PHORGE_GIT_REV=${{ steps.metadata.outputs.phorge_revision }}
+            ARCANIST_GIT_REV=${{ steps.metadata.outputs.arcanist_revision }}
           cache-from: type=gha,scope=phorge-${{ matrix.artifact }}
           cache-to: type=gha,mode=max,scope=phorge-${{ matrix.artifact }}
           outputs: type=image,name=${{ steps.metadata.outputs.image }},push-by-digest=true,name-canonical=true,push=true

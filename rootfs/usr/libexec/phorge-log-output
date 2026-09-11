@@ -1,0 +1,10 @@
+#!/bin/bash
+set -euo pipefail
+
+log_tag="$1"
+shift
+
+# Forward initialization output to rsyslog without copying it to the console.
+# pipefail preserves both command and forwarding failures.
+"$@" 2>&1 | logger --socket /dev/log --socket-errors=on \
+    --tag "$log_tag" --priority daemon.info --size 65536

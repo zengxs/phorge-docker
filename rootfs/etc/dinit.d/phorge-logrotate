@@ -1,0 +1,9 @@
+type = process
+command = /usr/libexec/phorge-logrotate
+depends-on: phorge-runtime-init
+depends-on: phorge-log@phorge-logrotate
+restart = on-failure
+restart-delay = 60
+smooth-recovery = true
+stop-timeout = 10
+log-type = pipe

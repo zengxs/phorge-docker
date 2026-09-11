@@ -1,0 +1,9 @@
+type = scripted
+command = /usr/libexec/phorge-log-output phorge-storage-upgrade /usr/libexec/phorge-storage-upgrade
+working-dir = /opt/phorge
+run-as = phorge
+load-options = export-passwd-vars
+depends-on: phorge-prepare
+start-timeout = 0
+restart = false
+options = shares-console start-interruptible

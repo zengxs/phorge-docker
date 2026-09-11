@@ -1,0 +1,6 @@
+type = scripted
+command = /usr/libexec/phorge-log-output phorge-runtime-init /usr/libexec/phorge-runtime-init
+depends-on: phorge-dinit-log
+start-timeout = 0
+restart = false
+options = shares-console start-interruptible

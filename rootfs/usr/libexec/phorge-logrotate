@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+sleep_pid=
+cleanup() {
+    if [ -n "$sleep_pid" ]; then
+        kill "$sleep_pid" 2>/dev/null || true
+        wait "$sleep_pid" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM
+
+while :; do
+    /usr/sbin/logrotate \
+        --state /var/lib/phorge/logrotate/status \
+        /etc/logrotate.d/phorge
+    sleep 3600 &
+    sleep_pid=$!
+    wait "$sleep_pid"
+    sleep_pid=
+done

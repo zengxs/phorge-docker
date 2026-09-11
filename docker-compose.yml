@@ -36,15 +36,12 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        IMAGE_REVISION: "${IMAGE_REVISION:-development}"
-        PHORGE_REVISION: "${PHORGE_REVISION:-20aaead687fcc9376560adfa57c13a2201faedd4}"
-        ARCANIST_REVISION: "${ARCANIST_REVISION:-63de5a2953b79dbe6aac4ed92bdb64b45cad53d6}"
+        PHORGE_GIT_REV: "${PHORGE_GIT_REV:-20aaead687fcc9376560adfa57c13a2201faedd4}"
+        ARCANIST_GIT_REV: "${ARCANIST_GIT_REV:-63de5a2953b79dbe6aac4ed92bdb64b45cad53d6}"
     environment:
       PHORGE_BASE_URI: "${PHORGE_BASE_URI:-}"
       PHORGE_WEB_PORT: "${PHORGE_WEB_PORT:-8080}"
       PHORGE_SSH_PORT: "${PHORGE_SSH_PORT:-2222}"
-      PHORGE_VCS_USER: "${PHORGE_VCS_USER:-git}"
-      PHORGE_VCS_UID: "${PHORGE_VCS_UID:-10002}"
       PHORGE_DB_HOST: mysql
       PHORGE_DB_PORT: "3306"
       PHORGE_DB_USER: "${PHORGE_DB_USER:-phorge}"
@@ -59,6 +56,7 @@ services:
       - "${PHORGE_SSH_PORT:-2222}:22"
     volumes:
       - phorge-data:/var/lib/phorge
+      - phorge-logs:/var/log/phorge/logs
     secrets:
       - phorge_db_password
     networks:
@@ -66,12 +64,7 @@ services:
       - database
     tmpfs:
       - "/run:mode=0755"
-      - "/run/lock:mode=0755"
       - "/tmp:mode=1777"
-      - "/var/log/journal:mode=0755"
-    cgroup: private
-    security_opt:
-      - writable-cgroups=true
     healthcheck:
       test: >-
         base_uri="$${PHORGE_BASE_URI:-http://phorge.localhost:$${PHORGE_WEB_PORT:-8080}/}";
@@ -137,6 +130,7 @@ networks:
 
 volumes:
   phorge-data:
+  phorge-logs:
   mysql-data:
 
 secrets:

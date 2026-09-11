@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+log_tag="$1"
+fifo="$2"
+
+# Opening both ends lets the reader start before its producer and keeps the
+# stream open across PHP's per-message open/write/close calls.
+exec 3<>"$fifo"
+exec logger --socket /dev/log --socket-errors=on \
+    --tag "$log_tag" --priority daemon.info --size 65536 <&3
